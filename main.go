@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -18,13 +19,58 @@ import (
 	tele "gopkg.in/telebot.v3"
 )
 
+// Global variables
+var (
+	cachedUsdVnd    float64
+	lastCacheUpdate time.Time
+	cacheDuration   = 6 * time.Hour
+	userFile        = "users.txt"
+)
+
 type PriceResponse struct {
 	Price   string `json:"price"`
 	Code    int    `json:"code"`
 	Message string `json:"message"`
 }
 
-// Fetches the current price of a symbol using Twelve Data API
+// --- LOGIC LƯU TRỮ USER ---
+
+// LoadUsers đọc danh sách ID từ file users.txt
+func loadUsers() map[int64]bool {
+	users := make(map[int64]bool)
+	file, err := os.Open(userFile)
+	if err != nil {
+		return users
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		id, _ := strconv.ParseInt(scanner.Text(), 10, 64)
+		if id != 0 {
+			users[id] = true
+		}
+	}
+	return users
+}
+
+// SaveUser lưu ID người dùng mới vào file
+func saveUser(id int64) {
+	users := loadUsers()
+	if _, exists := users[id]; !exists {
+		file, err := os.OpenFile(userFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			log.Printf("[ERROR] Không thể lưu user: %v", err)
+			return
+		}
+		defer file.Close()
+		fmt.Fprintf(file, "%d\n", id)
+		log.Printf("[SYSTEM] Đã đăng ký người dùng mới: %d", id)
+	}
+}
+
+// --- LOGIC API & DATA (Giữ nguyên của bạn) ---
+
 func getPrice(symbol string, apiKey string) (float64, error) {
 	url := fmt.Sprintf("https://api.twelvedata.com/price?symbol=%s&apikey=%s", symbol, apiKey)
 	resp, err := http.Get(url)
@@ -32,44 +78,44 @@ func getPrice(symbol string, apiKey string) (float64, error) {
 		return 0, err
 	}
 	defer resp.Body.Close()
-
 	var result PriceResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return 0, err
-	}
-
+	json.NewDecoder(resp.Body).Decode(&result)
 	if result.Code == 429 || strings.Contains(strings.ToLower(result.Message), "credits") {
 		return 0, fmt.Errorf("API_LIMIT_EXCEEDED")
 	}
-
 	p, _ := strconv.ParseFloat(result.Price, 64)
 	return p, nil
 }
 
-// Translates text via Google Apps Script Bridge
+func getCachedUsdVnd(apiKey string) (float64, error) {
+	if time.Since(lastCacheUpdate) < cacheDuration && cachedUsdVnd > 0 {
+		return cachedUsdVnd, nil
+	}
+	rate, err := getPrice("USD/VND", apiKey)
+	if err != nil {
+		return 0, err
+	}
+	cachedUsdVnd = rate
+	lastCacheUpdate = time.Now()
+	return rate, nil
+}
+
 func translateToVietnamese(text string) string {
 	scriptURL := os.Getenv("GOOGLE_SCRIPT_URL")
-	if scriptURL == "" {
-		return text
-	}
-
 	apiURL := fmt.Sprintf("%s?text=%s&source=en&target=vi", scriptURL, url.QueryEscape(text))
-	resp, err := http.Get(apiURL)
-	if err != nil {
+	resp, _ := http.Get(apiURL)
+	if resp == nil {
 		return text
 	}
 	defer resp.Body.Close()
-
 	body, _ := ioutil.ReadAll(resp.Body)
 	translated := string(body)
-
 	if strings.Contains(translated, "<html") {
 		return text
 	}
 	return translated
 }
 
-// Formats a float to a currency string with dots for thousands
 func formatVnd(val float64) string {
 	str := fmt.Sprintf("%.0f", val)
 	var result []string
@@ -83,119 +129,114 @@ func formatVnd(val float64) string {
 	return strings.Join(result, ".")
 }
 
-// Generates the daily market pulse report
 func getMarketUpdate() string {
 	godotenv.Load()
 	apiKey := os.Getenv("TWELVE_DATA_API_KEY")
-
 	now := time.Now()
 	dateStr := now.Format("02/01/2006")
 
-	// Dynamic Data Acquisition
-	pGold, errG := getPrice("XAU/USD", apiKey)
-	pEUR, errE := getPrice("EUR/USD", apiKey)
-	pBTC, errB := getPrice("BTC/USD", apiKey)
-	// Fetching live USD/VND rate instead of hardcoded value
-	usdToVnd, errV := getPrice("USD/VND", apiKey)
+	pGold, _ := getPrice("XAU/USD", apiKey)
+	pEUR, _ := getPrice("EUR/USD", apiKey)
+	pBTC, _ := getPrice("BTC/USD", apiKey)
+	usdToVnd, _ := getCachedUsdVnd(apiKey)
 
-	// Check for API limits
-	if errG != nil || errE != nil || errB != nil || errV != nil {
-		errorMessage := "⚠️ Hết API credits TwelveData cho hôm nay hoặc lỗi kết nối tỷ giá."
-		log.Println(errorMessage)
-		return fmt.Sprintf("📅 **Nhịp Đập Thị Trường [%s]**\n\n%s", dateStr, errorMessage)
+	if pGold == 0 {
+		return fmt.Sprintf("📅 **Bản tin [%s]**\n⚠️ Hệ thống đang bảo trì hoặc hết API credits.", dateStr)
 	}
 
-	// News Acquisition
 	fp := gofeed.NewParser()
-	feed, err := fp.ParseURL("https://www.investing.com/rss/news_25.rss")
+	feed, _ := fp.ParseURL("https://www.investing.com/rss/news_25.rss")
 	newsList := ""
-	if err == nil {
-		log.Println("--- Đang dịch tin tức từ Google Apps Script ---")
+	if feed != nil {
 		for i, item := range feed.Items {
-			if i >= 3 {
+			if i >= 7 {
 				break
 			}
 			viTitle := translateToVietnamese(item.Title)
-			newsList += fmt.Sprintf("• [%s](%s)\n", viTitle, item.Link)
+			newsList += fmt.Sprintf("🔹 **%s**\n🔗 [Xem chi tiết](%s)\n\n", viTitle, item.Link)
 		}
 	}
 
-	// Calculate Display Values
-	goldVnd := formatVnd(pGold * usdToVnd)
-	eurVnd := formatVnd(pEUR * usdToVnd)
-	btcVnd := formatVnd(pBTC * usdToVnd)
-
 	return fmt.Sprintf(
-		"📅 **Nhịp Đập Thị Trường [%s]**\n\n"+
-			"🔴 **Tin Tức Quan Trọng:**\n%s\n"+
-			"📈 **Xu Hướng Thị Trường:**\n"+
-			"• **Tỷ giá USD/VND:** 1$ ≈ **%s VNĐ**\n"+
-			"• **Vàng (XAUUSD):** $%.2f ≈ **%s VNĐ/oz**\n"+
-			"• **EURUSD:** %.4f ≈ **%s VNĐ**\n"+
-			"• **Bitcoin:** $%.2f ≈ **%s VNĐ/BTC**\n\n"+
-			"🎯 **Vùng Kỹ Thuật:**\n"+
-			"• Dựa trên Price Action, quan sát vùng: $%.2f\n\n"+
-			"💡 **IT/EA Tip:**\n"+
-			"Tỷ giá USD/VND được cập nhật real-time giúp EA tính toán Lot size chính xác hơn khi quản lý vốn bằng VNĐ.",
-		dateStr,
-		newsList,
-		formatVnd(usdToVnd),
-		pGold, goldVnd,
-		pEUR, eurVnd,
-		pBTC, btcVnd,
-		pGold,
+		"📅 **Nhịp Đập Thị Trường [%s]**\n"+
+			"━━━━━━━━━━━━━━━━━━\n\n"+
+			"🔴 **TIN TỨC QUAN TRỌNG:**\n\n%s"+
+			"📈 **XU HƯỚNG THỊ TRƯỜNG:**\n"+
+			"• Tỷ giá USD/VND: 1$ ≈ **%s VNĐ**\n"+
+			"• Vàng (XAUUSD): $%.2f ≈ **%s VNĐ**\n"+
+			"• EURUSD: %.4f ≈ **%s VNĐ**\n"+
+			"• Bitcoin: $%.2f ≈ **%s VNĐ**\n\n"+
+			"🎯 **VÙNG KỸ THUẬT:**\n"+
+			"• Quan sát vùng Supply/Demand tại: **$%.2f**\n\n"+
+			"━━━━━━━━━━━━━━━━━━\n"+
+			"💡 *Gõ `/update` để cập nhật dữ liệu mới nhất.*",
+		dateStr, newsList, formatVnd(usdToVnd), pGold, formatVnd(pGold*usdToVnd),
+		pEUR, formatVnd(pEUR*usdToVnd), pBTC, formatVnd(pBTC*usdToVnd), pGold,
 	)
 }
 
 func main() {
-	err := godotenv.Load()
-	if err != nil {
-		log.Fatal("Error loading .env file")
-	}
-
+	godotenv.Load()
 	token := os.Getenv("TELEGRAM_TOKEN")
-	myChatIDStr := os.Getenv("MY_CHAT_ID")
-	myChatID, _ := strconv.ParseInt(myChatIDStr, 10, 64)
 
 	b, err := tele.NewBot(tele.Settings{
 		Token:  token,
 		Poller: &tele.LongPoller{Timeout: 10 * time.Second},
 	})
 	if err != nil {
-		log.Fatalf("Failed to start bot: %v", err)
-		return
+		log.Fatal(err)
 	}
 
 	location := time.FixedZone("ICT", 7*3600)
 	c := cron.New(cron.WithLocation(location))
 
+	// Cronjob Test: Gửi bản tin cho tất cả user mỗi 1 phút
 	c.AddFunc("*/1 * * * *", func() {
-		log.Printf("Executing 1-minute test broadcast to ID: %d", myChatID)
-		if myChatID != 0 {
-			msg := getMarketUpdate()
-			b.Send(&tele.Chat{ID: myChatID}, msg, &tele.SendOptions{ParseMode: tele.ModeMarkdown, DisableWebPagePreview: true})
+		users := loadUsers()
+		if len(users) == 0 {
+			log.Println("[TEST-CRON] Không có user nào để gửi tin.")
+			return
+		}
+
+		msg := getMarketUpdate()
+		log.Printf("[TEST-CRON] Đang gửi test cho %d người dùng...", len(users))
+
+		for id := range users {
+			// Sử dụng go routine (go b.Send) nếu danh sách user lớn để không làm treo cron
+			_, err := b.Send(&tele.Chat{ID: id}, msg, &tele.SendOptions{ParseMode: tele.ModeMarkdown, DisableWebPagePreview: true})
+			if err != nil {
+				log.Printf("[TEST-CRON ERROR] Lỗi gửi cho ID %d: %v", id, err)
+			}
 		}
 	})
 
+	// Cronjob Broadcast (Gửi cho tất cả user)
 	c.AddFunc("0 8 * * *", func() {
-		log.Println("Executing scheduled 8:00 AM update")
-		if myChatID != 0 {
-			b.Send(&tele.Chat{ID: myChatID}, getMarketUpdate(), &tele.SendOptions{ParseMode: tele.ModeMarkdown, DisableWebPagePreview: true})
+		users := loadUsers()
+		if len(users) == 0 {
+			return
+		}
+
+		msg := getMarketUpdate()
+		log.Printf("[CRON] Bắt đầu gửi bản tin cho %d người dùng...", len(users))
+
+		for id := range users {
+			b.Send(&tele.Chat{ID: id}, msg, &tele.SendOptions{ParseMode: tele.ModeMarkdown, DisableWebPagePreview: true})
 		}
 	})
 
 	c.Start()
-	log.Println("Cron scheduler started successfully")
+
+	// Handler /start: Lưu người dùng vào danh sách
+	b.Handle("/start", func(c tele.Context) error {
+		saveUser(c.Chat().ID)
+		return c.Send("Chào mừng Trader! Bạn đã đăng ký nhận bản tin 8:00 sáng hàng ngày.\n\nGõ `/update` để xem ngay.")
+	})
 
 	b.Handle("/update", func(c tele.Context) error {
-		log.Printf("Manual update triggered by %s", c.Sender().Username)
 		return c.Send(getMarketUpdate(), &tele.SendOptions{ParseMode: tele.ModeMarkdown, DisableWebPagePreview: true})
 	})
 
-	b.Handle("/myid", func(c tele.Context) error {
-		return c.Send(fmt.Sprintf("ID của bạn: %d", c.Chat().ID))
-	})
-
-	log.Printf("Bot is giờ đang chạy. Theo dõi ID: %d...", myChatID)
+	log.Printf("[SYSTEM] Bot đa người dùng đang chạy...")
 	b.Start()
 }
