@@ -19,7 +19,7 @@ import (
 	tele "gopkg.in/telebot.v3"
 )
 
-// Global variables
+// Global variables for price caching and user management
 var (
 	cachedUsdVnd    float64
 	lastCacheUpdate time.Time
@@ -27,15 +27,16 @@ var (
 	userFile        = "users.txt"
 )
 
+// PriceResponse represents the standard JSON structure from Twelve Data API
 type PriceResponse struct {
 	Price   string `json:"price"`
 	Code    int    `json:"code"`
 	Message string `json:"message"`
 }
 
-// --- LOGIC LƯU TRỮ USER ---
+// --- USER MANAGEMENT LOGIC ---
 
-// LoadUsers đọc danh sách ID từ file users.txt
+// loadUsers reads unique Telegram chat IDs from the local storage file
 func loadUsers() map[int64]bool {
 	users := make(map[int64]bool)
 	file, err := os.Open(userFile)
@@ -54,13 +55,14 @@ func loadUsers() map[int64]bool {
 	return users
 }
 
-// SaveUser lưu ID người dùng mới vào file
+// saveUser appends a new Telegram chat ID to the storage file if it does not exist
 func saveUser(id int64) {
 	users := loadUsers()
 	if _, exists := users[id]; !exists {
 		file, err := os.OpenFile(userFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
-			log.Printf("[ERROR] Không thể lưu user: %v", err)
+			log.Printf("[ERROR] Không thể lưu user: %v",
+				err)
 			return
 		}
 		defer file.Close()
@@ -69,17 +71,21 @@ func saveUser(id int64) {
 	}
 }
 
-// --- LOGIC API & DATA (Giữ nguyên của bạn) ---
+// --- MARKET DATA & API LOGIC ---
 
+// getPrice retrieves the current price for a given symbol using the Twelve Data API
 func getPrice(symbol string, apiKey string) (float64, error) {
-	url := fmt.Sprintf("https://api.twelvedata.com/price?symbol=%s&apikey=%s", symbol, apiKey)
-	resp, err := http.Get(url)
+	apiUrl := fmt.Sprintf("https://api.twelvedata.com/price?symbol=%s&apikey=%s", symbol, apiKey)
+	resp, err := http.Get(apiUrl)
 	if err != nil {
 		return 0, err
 	}
 	defer resp.Body.Close()
+
 	var result PriceResponse
 	json.NewDecoder(resp.Body).Decode(&result)
+
+	// Check for API rate limits or credit exhaustion
 	if result.Code == 429 || strings.Contains(strings.ToLower(result.Message), "credits") {
 		return 0, fmt.Errorf("API_LIMIT_EXCEEDED")
 	}
@@ -87,6 +93,7 @@ func getPrice(symbol string, apiKey string) (float64, error) {
 	return p, nil
 }
 
+// getCachedUsdVnd provides the USD/VND rate from cache or fetches new data if expired
 func getCachedUsdVnd(apiKey string) (float64, error) {
 	if time.Since(lastCacheUpdate) < cacheDuration && cachedUsdVnd > 0 {
 		return cachedUsdVnd, nil
@@ -100,6 +107,7 @@ func getCachedUsdVnd(apiKey string) (float64, error) {
 	return rate, nil
 }
 
+// translateToVietnamese leverages a Google Apps Script bridge to translate news headlines
 func translateToVietnamese(text string) string {
 	scriptURL := os.Getenv("GOOGLE_SCRIPT_URL")
 	apiURL := fmt.Sprintf("%s?text=%s&source=en&target=vi", scriptURL, url.QueryEscape(text))
@@ -116,6 +124,7 @@ func translateToVietnamese(text string) string {
 	return translated
 }
 
+// formatVnd converts a float value into a formatted currency string with thousand separators
 func formatVnd(val float64) string {
 	str := fmt.Sprintf("%.0f", val)
 	var result []string
@@ -129,21 +138,25 @@ func formatVnd(val float64) string {
 	return strings.Join(result, ".")
 }
 
+// getMarketUpdate aggregates financial data and news headlines into a single formatted report
 func getMarketUpdate() string {
 	godotenv.Load()
 	apiKey := os.Getenv("TWELVE_DATA_API_KEY")
 	now := time.Now()
 	dateStr := now.Format("02/01/2006")
 
+	// Fetch current market prices
 	pGold, _ := getPrice("XAU/USD", apiKey)
 	pEUR, _ := getPrice("EUR/USD", apiKey)
 	pBTC, _ := getPrice("BTC/USD", apiKey)
 	usdToVnd, _ := getCachedUsdVnd(apiKey)
 
+	// Validate data availability
 	if pGold == 0 {
 		return fmt.Sprintf("📅 **Bản tin [%s]**\n⚠️ Hệ thống đang bảo trì hoặc hết API credits.", dateStr)
 	}
 
+	// Parse financial news feed
 	fp := gofeed.NewParser()
 	feed, _ := fp.ParseURL("https://www.investing.com/rss/news_25.rss")
 	newsList := ""
@@ -157,6 +170,7 @@ func getMarketUpdate() string {
 		}
 	}
 
+	// Build the final Telegram message content
 	return fmt.Sprintf(
 		"📅 **Nhịp Đập Thị Trường [%s]**\n"+
 			"━━━━━━━━━━━━━━━━━━\n\n"+
@@ -175,7 +189,10 @@ func getMarketUpdate() string {
 	)
 }
 
+// --- MAIN EXECUTION ---
+
 func main() {
+	// Initialize environment variables and bot settings
 	godotenv.Load()
 	token := os.Getenv("TELEGRAM_TOKEN")
 
@@ -187,10 +204,11 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// Setup task scheduler with ICT (UTC+7) timezone
 	location := time.FixedZone("ICT", 7*3600)
 	c := cron.New(cron.WithLocation(location))
 
-	// Cronjob Test: Gửi bản tin cho tất cả user mỗi 1 phút
+	// Test Job: Broadcast market updates every 1 minute
 	c.AddFunc("*/1 * * * *", func() {
 		users := loadUsers()
 		if len(users) == 0 {
@@ -202,7 +220,6 @@ func main() {
 		log.Printf("[TEST-CRON] Đang gửi test cho %d người dùng...", len(users))
 
 		for id := range users {
-			// Sử dụng go routine (go b.Send) nếu danh sách user lớn để không làm treo cron
 			_, err := b.Send(&tele.Chat{ID: id}, msg, &tele.SendOptions{ParseMode: tele.ModeMarkdown, DisableWebPagePreview: true})
 			if err != nil {
 				log.Printf("[TEST-CRON ERROR] Lỗi gửi cho ID %d: %v", id, err)
@@ -210,7 +227,7 @@ func main() {
 		}
 	})
 
-	// Cronjob Broadcast (Gửi cho tất cả user)
+	// Daily Job: Broadcast market updates at 08:00 AM daily
 	c.AddFunc("0 8 * * *", func() {
 		users := loadUsers()
 		if len(users) == 0 {
@@ -227,16 +244,18 @@ func main() {
 
 	c.Start()
 
-	// Handler /start: Lưu người dùng vào danh sách
+	// Handler for /start command: Registers the user and sends a welcome message
 	b.Handle("/start", func(c tele.Context) error {
 		saveUser(c.Chat().ID)
 		return c.Send("Chào mừng Trader! Bạn đã đăng ký nhận bản tin 8:00 sáng hàng ngày.\n\nGõ `/update` để xem ngay.")
 	})
 
+	// Handler for /update command: Provides an on-demand market report
 	b.Handle("/update", func(c tele.Context) error {
 		return c.Send(getMarketUpdate(), &tele.SendOptions{ParseMode: tele.ModeMarkdown, DisableWebPagePreview: true})
 	})
 
+	// Launch the bot
 	log.Printf("[SYSTEM] Bot đa người dùng đang chạy...")
 	b.Start()
 }
