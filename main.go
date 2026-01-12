@@ -1,7 +1,7 @@
 package main
 
 import (
-	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -13,89 +13,97 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aws/aws-lambda-go/events"
+	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/joho/godotenv"
 	"github.com/mmcdole/gofeed"
 	"github.com/robfig/cron/v3"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 	tele "gopkg.in/telebot.v3"
 )
 
-// Global variables for price caching and user management
+// Global variables
 var (
 	cachedUsdVnd    float64
 	lastCacheUpdate time.Time
 	cacheDuration   = 6 * time.Hour
-	userFile        = "users.txt"
+	userCollection  *mongo.Collection
 )
 
-// PriceResponse represents the standard JSON structure from Twelve Data API
 type PriceResponse struct {
 	Price   string `json:"price"`
 	Code    int    `json:"code"`
 	Message string `json:"message"`
 }
 
-// --- USER MANAGEMENT LOGIC ---
+// --- DATABASE LOGIC ---
 
-// loadUsers reads unique Telegram chat IDs from the local storage file
+func initDatabase() {
+	uri := os.Getenv("MONGODB_URI")
+	client, err := mongo.Connect(context.TODO(), options.Client().ApplyURI(uri))
+	if err != nil {
+		log.Fatal(err)
+	}
+	userCollection = client.Database("market_bot").Collection("users")
+	log.Println("[DATABASE] Connected to MongoDB Atlas")
+}
+
 func loadUsers() map[int64]bool {
 	users := make(map[int64]bool)
-	file, err := os.Open(userFile)
+	cursor, err := userCollection.Find(context.TODO(), bson.M{})
 	if err != nil {
+		log.Printf("[DATABASE ERROR] Failed to find users: %v", err)
 		return users
 	}
-	defer file.Close()
+	defer cursor.Close(context.TODO())
 
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		id, _ := strconv.ParseInt(scanner.Text(), 10, 64)
-		if id != 0 {
-			users[id] = true
+	for cursor.Next(context.TODO()) {
+		var result struct {
+			ChatID int64 `bson:"chat_id"`
 		}
+		cursor.Decode(&result)
+		users[result.ChatID] = true
 	}
 	return users
 }
 
-// saveUser appends a new Telegram chat ID to the storage file if it does not exist
 func saveUser(id int64) {
-	users := loadUsers()
-	if _, exists := users[id]; !exists {
-		file, err := os.OpenFile(userFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
-			log.Printf("[ERROR] Không thể lưu user: %v",
-				err)
-			return
-		}
-		defer file.Close()
-		fmt.Fprintf(file, "%d\n", id)
-		log.Printf("[SYSTEM] Đã đăng ký người dùng mới: %d", id)
+	filter := bson.M{"chat_id": id}
+	update := bson.M{"$set": bson.M{"chat_id": id, "updated_at": time.Now()}}
+	_, err := userCollection.UpdateOne(context.TODO(), filter, update, options.Update().SetUpsert(true))
+	if err != nil {
+		log.Printf("[DATABASE ERROR] Failed to save user %d: %v", id, err)
+	} else {
+		log.Printf("[DATABASE] User %d saved/updated", id)
 	}
 }
 
-// --- MARKET DATA & API LOGIC ---
+// --- MARKET DATA LOGIC ---
 
-// getPrice retrieves the current price for a given symbol using the Twelve Data API
 func getPrice(symbol string, apiKey string) (float64, error) {
+	log.Printf("[API] Fetching price for %s...", symbol)
 	apiUrl := fmt.Sprintf("https://api.twelvedata.com/price?symbol=%s&apikey=%s", symbol, apiKey)
 	resp, err := http.Get(apiUrl)
 	if err != nil {
 		return 0, err
 	}
 	defer resp.Body.Close()
-
 	var result PriceResponse
 	json.NewDecoder(resp.Body).Decode(&result)
-
-	// Check for API rate limits or credit exhaustion
 	if result.Code == 429 || strings.Contains(strings.ToLower(result.Message), "credits") {
+		log.Printf("[API ERROR] Rate limit or credits exhausted for %s", symbol)
 		return 0, fmt.Errorf("API_LIMIT_EXCEEDED")
 	}
 	p, _ := strconv.ParseFloat(result.Price, 64)
+	log.Printf("[API] %s Price: %.2f", symbol, p)
 	return p, nil
 }
 
-// getCachedUsdVnd provides the USD/VND rate from cache or fetches new data if expired
 func getCachedUsdVnd(apiKey string) (float64, error) {
 	if time.Since(lastCacheUpdate) < cacheDuration && cachedUsdVnd > 0 {
+		log.Println("[CACHE] Using cached USD/VND rate")
 		return cachedUsdVnd, nil
 	}
 	rate, err := getPrice("USD/VND", apiKey)
@@ -107,7 +115,6 @@ func getCachedUsdVnd(apiKey string) (float64, error) {
 	return rate, nil
 }
 
-// translateToVietnamese leverages a Google Apps Script bridge to translate news headlines
 func translateToVietnamese(text string) string {
 	scriptURL := os.Getenv("GOOGLE_SCRIPT_URL")
 	apiURL := fmt.Sprintf("%s?text=%s&source=en&target=vi", scriptURL, url.QueryEscape(text))
@@ -117,14 +124,9 @@ func translateToVietnamese(text string) string {
 	}
 	defer resp.Body.Close()
 	body, _ := ioutil.ReadAll(resp.Body)
-	translated := string(body)
-	if strings.Contains(translated, "<html") {
-		return text
-	}
-	return translated
+	return string(body)
 }
 
-// formatVnd converts a float value into a formatted currency string with thousand separators
 func formatVnd(val float64) string {
 	str := fmt.Sprintf("%.0f", val)
 	var result []string
@@ -138,29 +140,27 @@ func formatVnd(val float64) string {
 	return strings.Join(result, ".")
 }
 
-// getMarketUpdate aggregates financial data and news headlines into a single formatted report
 func getMarketUpdate() string {
-	godotenv.Load()
+	log.Println("[SYSTEM] Generating market update report...")
 	apiKey := os.Getenv("TWELVE_DATA_API_KEY")
 	now := time.Now()
-	dateStr := now.Format("02/01/2006")
+	dateStr := now.Format("02/01/2006 15:04:05")
 
-	// Fetch current market prices
 	pGold, _ := getPrice("XAU/USD", apiKey)
 	pEUR, _ := getPrice("EUR/USD", apiKey)
 	pBTC, _ := getPrice("BTC/USD", apiKey)
 	usdToVnd, _ := getCachedUsdVnd(apiKey)
 
-	// Validate data availability
 	if pGold == 0 {
-		return fmt.Sprintf("📅 **Bản tin [%s]**\n⚠️ Hệ thống đang bảo trì hoặc hết API credits.", dateStr)
+		return fmt.Sprintf("📅 **Bản tin [%s]**\n⚠️ API credits exhausted.", dateStr)
 	}
 
-	// Parse financial news feed
+	log.Println("[RSS] Fetching news from Investing.com...")
 	fp := gofeed.NewParser()
 	feed, _ := fp.ParseURL("https://www.investing.com/rss/news_25.rss")
 	newsList := ""
 	if feed != nil {
+		log.Printf("[RSS] Successfully parsed %d items", len(feed.Items))
 		for i, item := range feed.Items {
 			if i >= 7 {
 				break
@@ -170,7 +170,7 @@ func getMarketUpdate() string {
 		}
 	}
 
-	// Build the final Telegram message content
+	log.Println("[SYSTEM] Market update report generated successfully")
 	return fmt.Sprintf(
 		"📅 **Nhịp Đập Thị Trường [%s]**\n"+
 			"━━━━━━━━━━━━━━━━━━\n\n"+
@@ -180,82 +180,103 @@ func getMarketUpdate() string {
 			"• Vàng (XAUUSD): $%.2f ≈ **%s VNĐ**\n"+
 			"• EURUSD: %.4f ≈ **%s VNĐ**\n"+
 			"• Bitcoin: $%.2f ≈ **%s VNĐ**\n\n"+
-			"🎯 **VÙNG KỸ THUẬT:**\n"+
-			"• Quan sát vùng Supply/Demand tại: **$%.2f**\n\n"+
 			"━━━━━━━━━━━━━━━━━━\n"+
 			"💡 *Gõ `/update` để cập nhật dữ liệu mới nhất.*",
 		dateStr, newsList, formatVnd(usdToVnd), pGold, formatVnd(pGold*usdToVnd),
-		pEUR, formatVnd(pEUR*usdToVnd), pBTC, formatVnd(pBTC*usdToVnd), pGold,
+		pEUR, formatVnd(pEUR*usdToVnd), pBTC, formatVnd(pBTC*usdToVnd),
 	)
 }
 
-// --- MAIN EXECUTION ---
+// --- HANDLERS ---
 
-func main() {
-	// Initialize environment variables and bot settings
-	godotenv.Load()
+func Handler(ctx context.Context, request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
+	initDatabase()
 	token := os.Getenv("TELEGRAM_TOKEN")
-
-	b, err := tele.NewBot(tele.Settings{
-		Token:  token,
-		Poller: &tele.LongPoller{Timeout: 10 * time.Second},
+	b, _ := tele.NewBot(tele.Settings{
+		Token:       token,
+		Synchronous: true,
 	})
-	if err != nil {
-		log.Fatal(err)
-	}
 
-	// Setup task scheduler with ICT (UTC+7) timezone
-	location := time.FixedZone("ICT", 7*3600)
-	c := cron.New(cron.WithLocation(location))
-
-	// Test Job: Broadcast market updates every 1 minute
-	// c.AddFunc("*/1 * * * *", func() {
-	// 	users := loadUsers()
-	// 	if len(users) == 0 {
-	// 		log.Println("[TEST-CRON] Không có user nào để gửi tin.")
-	// 		return
-	// 	}
-
-	// 	msg := getMarketUpdate()
-	// 	log.Printf("[TEST-CRON] Đang gửi test cho %d người dùng...", len(users))
-
-	// 	for id := range users {
-	// 		_, err := b.Send(&tele.Chat{ID: id}, msg, &tele.SendOptions{ParseMode: tele.ModeMarkdown, DisableWebPagePreview: true})
-	// 		if err != nil {
-	// 			log.Printf("[TEST-CRON ERROR] Lỗi gửi cho ID %d: %v", id, err)
-	// 		}
-	// 	}
-	// })
-
-	// Daily Job: Broadcast market updates at 08:00 AM daily
-	c.AddFunc("0 8 * * *", func() {
+	if request.HTTPMethod == "" {
+		log.Println("[LAMBDA] Cron trigger received")
 		users := loadUsers()
-		if len(users) == 0 {
-			return
-		}
-
 		msg := getMarketUpdate()
-		log.Printf("[CRON] Bắt đầu gửi bản tin cho %d người dùng...", len(users))
-
 		for id := range users {
 			b.Send(&tele.Chat{ID: id}, msg, &tele.SendOptions{ParseMode: tele.ModeMarkdown, DisableWebPagePreview: true})
 		}
-	})
+		return events.APIGatewayProxyResponse{StatusCode: 200, Body: "Broadcast sent"}, nil
+	}
 
-	c.Start()
+	var update tele.Update
+	if err := json.Unmarshal([]byte(request.Body), &update); err != nil {
+		return events.APIGatewayProxyResponse{StatusCode: 400}, nil
+	}
 
-	// Handler for /start command: Registers the user and sends a welcome message
-	b.Handle("/start", func(c tele.Context) error {
-		saveUser(c.Chat().ID)
-		return c.Send("Chào mừng Trader! Bạn đã đăng ký nhận bản tin 8:00 sáng hàng ngày.\n\nGõ `/update` để xem ngay.")
-	})
+	if update.Message != nil {
+		m := update.Message
+		log.Printf("[LAMBDA] Incoming message from %d: %s", m.Chat.ID, m.Text)
+		switch m.Text {
+		case "/start":
+			saveUser(m.Chat.ID)
+			b.Send(m.Chat, "Chào mừng Trader! Bạn đã đăng ký nhận bản tin 8h sáng.")
+		case "/update":
+			b.Send(m.Chat, getMarketUpdate(), &tele.SendOptions{ParseMode: tele.ModeMarkdown, DisableWebPagePreview: true})
+		}
+	}
 
-	// Handler for /update command: Provides an on-demand market report
-	b.Handle("/update", func(c tele.Context) error {
-		return c.Send(getMarketUpdate(), &tele.SendOptions{ParseMode: tele.ModeMarkdown, DisableWebPagePreview: true})
-	})
+	return events.APIGatewayProxyResponse{StatusCode: 200, Body: "OK"}, nil
+}
 
-	// Launch the bot
-	log.Printf("[SYSTEM] Bot đa người dùng đang chạy...")
-	b.Start()
+func main() {
+	godotenv.Load()
+
+	if os.Getenv("AWS_LAMBDA_FUNCTION_NAME") != "" {
+		lambda.Start(Handler)
+	} else {
+		log.Println("🚀 Starting Bot in LOCAL LONG-POLLING mode...")
+		initDatabase()
+		
+		token := os.Getenv("TELEGRAM_TOKEN")
+		b, err := tele.NewBot(tele.Settings{
+			Token:  token,
+			Poller: &tele.LongPoller{Timeout: 10 * time.Second},
+		})
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		// --- LOCAL CRONJOB (Every 1 Minute) ---
+		c := cron.New()
+		c.AddFunc("@every 1m", func() {
+			log.Println("[LOCAL CRON] Running 1-minute test broadcast...")
+			users := loadUsers()
+			if len(users) == 0 {
+				log.Println("[LOCAL CRON] No users found in database.")
+				return
+			}
+			msg := getMarketUpdate()
+			for id := range users {
+				log.Printf("[LOCAL CRON] Sending update to %d", id)
+				b.Send(&tele.Chat{ID: id}, msg, &tele.SendOptions{ParseMode: tele.ModeMarkdown, DisableWebPagePreview: true})
+			}
+		})
+		c.Start()
+		log.Println("[LOCAL] 1-minute Cronjob started")
+
+		// --- LOCAL HANDLERS ---
+		b.Handle("/start", func(c tele.Context) error {
+			log.Printf("[LOCAL] User %d triggered /start", c.Chat().ID)
+			saveUser(c.Chat().ID)
+			return c.Send("Chào mừng Trader! (Local Mode)")
+		})
+
+		b.Handle("/update", func(c tele.Context) error {
+			log.Printf("[LOCAL] User %d requested /update", c.Chat().ID)
+			update := getMarketUpdate()
+			return c.Send(update, &tele.SendOptions{ParseMode: tele.ModeMarkdown, DisableWebPagePreview: true})
+		})
+
+		log.Println("[SYSTEM] Bot is listening. Press Ctrl+C to stop.")
+		b.Start()
+	}
 }
