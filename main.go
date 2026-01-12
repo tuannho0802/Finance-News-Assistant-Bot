@@ -209,23 +209,23 @@ func main() {
 	c := cron.New(cron.WithLocation(location))
 
 	// Test Job: Broadcast market updates every 1 minute
-	c.AddFunc("*/1 * * * *", func() {
-		users := loadUsers()
-		if len(users) == 0 {
-			log.Println("[TEST-CRON] Không có user nào để gửi tin.")
-			return
-		}
+	// c.AddFunc("*/1 * * * *", func() {
+	// 	users := loadUsers()
+	// 	if len(users) == 0 {
+	// 		log.Println("[TEST-CRON] Không có user nào để gửi tin.")
+	// 		return
+	// 	}
 
-		msg := getMarketUpdate()
-		log.Printf("[TEST-CRON] Đang gửi test cho %d người dùng...", len(users))
+	// 	msg := getMarketUpdate()
+	// 	log.Printf("[TEST-CRON] Đang gửi test cho %d người dùng...", len(users))
 
-		for id := range users {
-			_, err := b.Send(&tele.Chat{ID: id}, msg, &tele.SendOptions{ParseMode: tele.ModeMarkdown, DisableWebPagePreview: true})
-			if err != nil {
-				log.Printf("[TEST-CRON ERROR] Lỗi gửi cho ID %d: %v", id, err)
-			}
-		}
-	})
+	// 	for id := range users {
+	// 		_, err := b.Send(&tele.Chat{ID: id}, msg, &tele.SendOptions{ParseMode: tele.ModeMarkdown, DisableWebPagePreview: true})
+	// 		if err != nil {
+	// 			log.Printf("[TEST-CRON ERROR] Lỗi gửi cho ID %d: %v", id, err)
+	// 		}
+	// 	}
+	// })
 
 	// Daily Job: Broadcast market updates at 08:00 AM daily
 	c.AddFunc("0 8 * * *", func() {
