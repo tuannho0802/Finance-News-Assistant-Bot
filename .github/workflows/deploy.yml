@@ -23,7 +23,7 @@ jobs:
           zip bootstrap.zip bootstrap  # Tạo file tên là bootstrap.zip
 
       - name: Deploy to Lambda
-        uses: appleboy/lambda-action@master
+        uses: appleboy/lambda-action@v0.2.0 # Set specific version
         with:
           aws_access_key_id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws_secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
