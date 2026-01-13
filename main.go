@@ -51,9 +51,14 @@ type MarketData struct {
 
 func initDatabase() {
 	uri := os.Getenv("MONGODB_URI")
-	client, err := mongo.Connect(context.TODO(), options.Client().ApplyURI(uri))
+	// Set a timeout for connection to prevent hanging during cold starts
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	
+	client, err := mongo.Connect(ctx, options.Client().ApplyURI(uri))
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("[DATABASE ERROR] Connection failed: %v", err)
+		return
 	}
 	userCollection = client.Database("market_bot").Collection("users")
 	log.Println("[DATABASE] Connected to MongoDB Atlas")
@@ -61,6 +66,10 @@ func initDatabase() {
 
 func loadUsers() map[int64]bool {
 	users := make(map[int64]bool)
+	if userCollection == nil {
+		log.Println("[DATABASE ERROR] Collection is nil")
+		return users
+	}
 	cursor, err := userCollection.Find(context.TODO(), bson.M{})
 	if err != nil {
 		log.Printf("[DATABASE ERROR] Failed to find users: %v", err)
@@ -79,6 +88,10 @@ func loadUsers() map[int64]bool {
 }
 
 func saveUser(id int64) {
+	if userCollection == nil {
+		log.Println("[DATABASE ERROR] Cannot save, collection is nil")
+		return
+	}
 	filter := bson.M{"chat_id": id}
 	update := bson.M{"$set": bson.M{"chat_id": id, "updated_at": time.Now()}}
 	_, err := userCollection.UpdateOne(context.TODO(), filter, update, options.Update().SetUpsert(true))
@@ -91,12 +104,15 @@ func saveUser(id int64) {
 
 // --- MARKET DATA LOGIC ---
 
-// Modified to use /quote endpoint for both price and percentage change
 func getMarketData(symbol string, apiKey string) MarketData {
 	log.Printf("[API] Fetching quote for %s...", symbol)
 	apiUrl := fmt.Sprintf("https://api.twelvedata.com/quote?symbol=%s&apikey=%s", symbol, apiKey)
-	resp, err := http.Get(apiUrl)
+	
+	// Explicit client with timeout to prevent Lambda from hanging
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Get(apiUrl)
 	if err != nil {
+		log.Printf("[API ERROR] Request failed for %s: %v", symbol, err)
 		return MarketData{Price: 0, Change: "0.00%"}
 	}
 	defer resp.Body.Close()
@@ -109,14 +125,14 @@ func getMarketData(symbol string, apiKey string) MarketData {
 	json.NewDecoder(resp.Body).Decode(&result)
 
 	if result.Message != "" {
-		log.Printf("[API ERROR] %s: %s", symbol, result.Message)
+		log.Printf("[API ERROR] Message from TwelveData for %s: %s", symbol, result.Message)
 		return MarketData{Price: 0, Change: "N/A"}
 	}
 
 	p, _ := strconv.ParseFloat(result.Close, 64)
 	c, _ := strconv.ParseFloat(result.PercentChange, 64)
 
-	// Format change string with trend icons
+	// Format change string with market trend indicators
 	changeStr := fmt.Sprintf("%.2f%%", c)
 	if c > 0 {
 		changeStr = "📈 +" + changeStr
@@ -132,7 +148,6 @@ func getCachedUsdVnd(apiKey string) (float64, error) {
 		log.Println("[CACHE] Using cached USD/VND rate")
 		return cachedUsdVnd, nil
 	}
-	// Fetching current rate from API
 	data := getMarketData("USD/VND", apiKey)
 	if data.Price == 0 {
 		return 25000, fmt.Errorf("API_ERROR")
@@ -144,9 +159,13 @@ func getCachedUsdVnd(apiKey string) (float64, error) {
 
 func translateToVietnamese(text string) string {
 	scriptURL := os.Getenv("GOOGLE_SCRIPT_URL")
+	if scriptURL == "" {
+		return text
+	}
 	apiURL := fmt.Sprintf("%s?text=%s&source=en&target=vi", scriptURL, url.QueryEscape(text))
-	resp, _ := http.Get(apiURL)
-	if resp == nil {
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(apiURL)
+	if err != nil || resp == nil {
 		return text
 	}
 	defer resp.Body.Close()
@@ -167,21 +186,19 @@ func formatVnd(val float64) string {
 	return strings.Join(result, ".")
 }
 
-// Modified to return message string and Inline Keyboard markup
 func getMarketUpdate() (string, *tele.ReplyMarkup) {
 	log.Println("[SYSTEM] Generating market update report...")
 	apiKey := os.Getenv("TWELVE_DATA_API_KEY")
 	now := time.Now()
 	dateStr := now.Format("02/01/2006 15:04:05")
 
-	// Fetch financial data with daily change
 	gold := getMarketData("XAU/USD", apiKey)
 	eur := getMarketData("EUR/USD", apiKey)
 	btc := getMarketData("BTC/USD", apiKey)
 	usdToVnd, _ := getCachedUsdVnd(apiKey)
 
 	if gold.Price == 0 {
-		return fmt.Sprintf("📅 **Bản tin [%s]**\n⚠️ API credits exhausted.", dateStr), nil
+		return fmt.Sprintf("📅 **Bản tin [%s]**\n⚠️ API credits exhausted or market closed.", dateStr), nil
 	}
 
 	log.Println("[RSS] Fetching news from Investing.com...")
@@ -189,7 +206,6 @@ func getMarketUpdate() (string, *tele.ReplyMarkup) {
 	feed, _ := fp.ParseURL("https://www.investing.com/rss/news_25.rss")
 	newsList := ""
 	if feed != nil {
-		log.Printf("[RSS] Successfully parsed %d items", len(feed.Items))
 		for i, item := range feed.Items {
 			if i >= 8 {
 				break
@@ -199,7 +215,6 @@ func getMarketUpdate() (string, *tele.ReplyMarkup) {
 		}
 	}
 
-	// Build report string with new UI format
 	report := fmt.Sprintf(
 		"💰 **NHỊP ĐẬP THỊ TRƯỜNG**\n📅 *Cập nhật: %s*\n"+
 			"━━━━━━━━━━━━━━━━━━\n\n"+
@@ -217,30 +232,33 @@ func getMarketUpdate() (string, *tele.ReplyMarkup) {
 		btc.Price, btc.Change,
 	)
 
-	// Create Inline Button for quick update
 	menu := &tele.ReplyMarkup{}
 	btnUpdate := menu.Data("🔄 Cập nhật giá mới", "btn_update_price")
 	menu.Inline(menu.Row(btnUpdate))
 
-	log.Println("[SYSTEM] Market update report generated successfully")
 	return report, menu
 }
 
 // --- HANDLERS (AWS LAMBDA) ---
 
-// Updated to use LambdaFunctionURLRequest for compatibility with AWS Lambda Function URL
 func Handler(ctx context.Context, request events.LambdaFunctionURLRequest) (events.LambdaFunctionURLResponse, error) {
 	initDatabase()
 	token := os.Getenv("TELEGRAM_TOKEN")
-	b, _ := tele.NewBot(tele.Settings{
+	
+	// Initialize bot in synchronous mode for Lambda environment
+	b, err := tele.NewBot(tele.Settings{
 		Token:       token,
 		Synchronous: true,
 	})
+	if err != nil {
+		log.Printf("[ERROR] Bot initialization failed: %v", err)
+		return events.LambdaFunctionURLResponse{StatusCode: 500}, nil
+	}
 
-	// --- CRON TRIGGER ---
-	// Updated condition to check empty body which is common for EventBridge/Direct URL calls
+	// --- CRON TRIGGER / DIRECT CALL ---
+	// EventBridge or direct URL calls without body are treated as broadcast triggers
 	if request.Body == "" {
-		log.Println("[LAMBDA] Cron trigger received")
+		log.Println("[LAMBDA] Empty body trigger detected")
 		users := loadUsers()
 		msg, menu := getMarketUpdate()
 		for id := range users {
@@ -250,28 +268,24 @@ func Handler(ctx context.Context, request events.LambdaFunctionURLRequest) (even
 				DisableWebPagePreview: true,
 			})
 		}
-		return events.LambdaFunctionURLResponse{StatusCode: 200, Body: "Broadcast sent"}, nil
+		return events.LambdaFunctionURLResponse{StatusCode: 200, Body: "Broadcast complete"}, nil
 	}
 
 	var update tele.Update
 	if err := json.Unmarshal([]byte(request.Body), &update); err != nil {
-		// Return 200 even on error to prevent Telegram from retrying indefinitely
-		return events.LambdaFunctionURLResponse{StatusCode: 200}, nil
+		log.Printf("[ERROR] Failed to parse Telegram update: %v", err)
+		return events.LambdaFunctionURLResponse{StatusCode: 200, Body: "Malformed request"}, nil
 	}
 
-	// Handle Inline Button callback for Lambda with Double Edit logic
+	// Handle Inline Button Callbacks
 	if update.Callback != nil {
-		log.Printf("[LAMBDA] Inline button clicked: %s", update.Callback.Data)
-
-		// Provide status update to user
+		log.Printf("[LAMBDA] Callback interaction: %s", update.Callback.Data)
 		b.Edit(update.Callback.Message, update.Callback.Message.Text+"\n\n⌛ *Đang cập nhật dữ liệu...*", &tele.SendOptions{
 			ParseMode:   tele.ModeMarkdown,
 			ReplyMarkup: update.Callback.Message.ReplyMarkup,
 		})
 
 		msg, menu := getMarketUpdate()
-
-		// Send final report
 		b.Edit(update.Callback.Message, msg+"\n\n✅ *Cập nhật thành công!*", &tele.SendOptions{
 			ParseMode:             tele.ModeMarkdown,
 			ReplyMarkup:           menu,
@@ -281,23 +295,17 @@ func Handler(ctx context.Context, request events.LambdaFunctionURLRequest) (even
 		return events.LambdaFunctionURLResponse{StatusCode: 200}, nil
 	}
 
+	// Handle Standard Messages
 	if update.Message != nil {
 		m := update.Message
-		log.Printf("[LAMBDA] Incoming message from %d: %s", m.Chat.ID, m.Text)
+		log.Printf("[LAMBDA] Message from %d: %s", m.Chat.ID, m.Text)
 		switch m.Text {
 		case "/start":
 			saveUser(m.Chat.ID)
 			b.Send(m.Chat, "Chào mừng Trader! Bạn đã đăng ký nhận bản tin tự động.")
 		case "/update":
-			// Send immediate feedback before API call
-			tmpMsg, err := b.Send(m.Chat, "⌛ *Đang lấy dữ liệu thị trường mới nhất...*", &tele.SendOptions{ParseMode: tele.ModeMarkdown})
-			if err != nil {
-				log.Printf("[ERROR] Failed to send temp message: %v", err)
-			}
-
+			tmpMsg, _ := b.Send(m.Chat, "⌛ *Đang lấy dữ liệu thị trường mới nhất...*", &tele.SendOptions{ParseMode: tele.ModeMarkdown})
 			msg, menu := getMarketUpdate()
-
-			// Update initial message with actual data
 			b.Edit(tmpMsg, msg, &tele.SendOptions{
 				ParseMode:             tele.ModeMarkdown,
 				ReplyMarkup:           menu,
@@ -308,19 +316,19 @@ func Handler(ctx context.Context, request events.LambdaFunctionURLRequest) (even
 		}
 	}
 
-	return events.LambdaFunctionURLResponse{StatusCode: 200, Body: "OK"}, nil
+	return events.LambdaFunctionURLResponse{StatusCode: 200, Body: "Processed"}, nil
 }
 
-// --- MAIN (LOCAL MODE) ---
+// --- MAIN (LOCAL & PROD) ---
 
 func main() {
 	godotenv.Load()
 
 	if os.Getenv("AWS_LAMBDA_FUNCTION_NAME") != "" {
-		// --- PRODUCTION MODE (AWS LAMBDA) ---
+		// Execution environment is AWS Lambda
 		lambda.Start(Handler)
 	} else {
-		// --- DEVELOPMENT MODE (LOCAL) ---
+		// Execution environment is Local Machine
 		log.Println("🚀 Starting Bot in LOCAL mode...")
 		initDatabase()
 
@@ -333,27 +341,14 @@ func main() {
 			log.Fatal(err)
 		}
 
-		// Commented out to prevent accidental webhook removal on production bot during testing
-		// b.RemoveWebhook()
-
-		// --- REGISTER HANDLERS ---
 		b.Handle("/start", func(c tele.Context) error {
 			saveUser(c.Chat().ID)
 			return c.Send("🛠 Chế độ thử nghiệm (Local Mode) đã sẵn sàng.")
 		})
 
 		b.Handle("/update", func(c tele.Context) error {
-			log.Printf("[LOCAL] Requesting market update...")
-
-			// Provide immediate feedback to the user
-			tmpMsg, err := b.Send(c.Chat(), "⌛ *Đang kết nối hệ thống dữ liệu...*", &tele.SendOptions{ParseMode: tele.ModeMarkdown})
-			if err != nil {
-				log.Printf("[LOCAL ERROR] Could not send placeholder: %v", err)
-			}
-
+			tmpMsg, _ := b.Send(c.Chat(), "⌛ *Đang cập nhật dữ liệu...*", &tele.SendOptions{ParseMode: tele.ModeMarkdown})
 			msg, menu := getMarketUpdate()
-
-			// Replace placeholder with live data
 			_, err = b.Edit(tmpMsg, msg, &tele.SendOptions{
 				ParseMode:             tele.ModeMarkdown,
 				ReplyMarkup:           menu,
@@ -362,52 +357,20 @@ func main() {
 			return err
 		})
 
-		// --- LOCAL CALLBACK HANDLERS ---
 		b.Handle("\fbtn_update_price", func(c tele.Context) error {
-			log.Printf("[LOCAL] Callback 'btn_update_price' received.")
-
-			// Acknowledge callback immediately
 			c.Respond(&tele.CallbackResponse{Text: "🔄 Đang lấy dữ liệu mới..."})
-
-			// Visual feedback for long-running operation
-			oldText := c.Message().Text
-			loadingText := oldText + "\n\n⌛ *Đang kết nối API và cập nhật dữ liệu...*"
-
-			c.Edit(loadingText, &tele.SendOptions{
-				ParseMode:             tele.ModeMarkdown,
-				ReplyMarkup:           c.Message().ReplyMarkup,
-				DisableWebPagePreview: true,
-			})
-
 			msg, menu := getMarketUpdate()
-
-			// Final render with fresh data
-			finalMsg := msg + "\n\n✅ *Cập nhật thành công!*"
-
-			return c.Edit(finalMsg, &tele.SendOptions{
+			return c.Edit(msg+"\n\n✅ *Cập nhật thành công!*", &tele.SendOptions{
 				ParseMode:             tele.ModeMarkdown,
 				ReplyMarkup:           menu,
 				DisableWebPagePreview: true,
 			})
 		})
 
-		b.Handle(tele.OnText, func(c tele.Context) error {
-			return c.Send("🤖 Bot đang chạy Local. Chỉ nhận lệnh /update.")
-		})
-
-		// --- GRACEFUL SHUTDOWN LOGIC ---
 		stop := make(chan os.Signal, 1)
 		signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-
-		go func() {
-			log.Println("[SYSTEM] Bot is listening. Press Ctrl+C to stop.")
-			b.Start()
-		}()
-
+		go b.Start()
 		<-stop
-
-		log.Println("\n[SHUTDOWN] Gracefully shutting down...")
 		b.Stop()
-		log.Println("[SHUTDOWN] Bot stopped. Exit successful.")
 	}
 }
