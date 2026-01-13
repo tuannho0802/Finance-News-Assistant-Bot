@@ -20,7 +20,7 @@ jobs:
       - name: Build binary
         run: |
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bootstrap main.go
-          zip deployment.zip bootstrap
+          zip bootstrap.zip bootstrap  # Tạo file tên là bootstrap.zip
 
       - name: Deploy to Lambda
         uses: appleboy/lambda-action@master
@@ -29,4 +29,4 @@ jobs:
           aws_secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws_region: ap-southeast-2
           function_name: market-bot-function
-          zip_file: deployment.zip
+          zip_file: bootstrap.zip 
