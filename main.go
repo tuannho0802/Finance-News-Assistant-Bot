@@ -47,14 +47,33 @@ type MarketData struct {
 	Change string
 }
 
+// --- CONSTANTS ---
+
+const helpMessage = `📖 *HƯỚNG DẪN SỬ DỤNG BOT*
+
+Dưới đây là danh sách các lệnh bạn có thể sử dụng:
+
+🚀 *Khởi đầu:*
+/start - Đăng ký nhận bản tin thị trường tự động hàng ngày.
+
+📊 *Tra cứu:*
+/update - Xem ngay báo cáo thị trường mới nhất (Vàng, BTC, Ngoại tệ & Tin tức).
+/help - Xem danh sách lệnh và hướng dẫn này.
+
+❌ *Ngừng nhận tin:*
+/quit hoặc /cancel - Hủy đăng ký và xóa dữ liệu của bạn khỏi hệ thống nhận tin tự động.
+
+💡 *Mẹo:* Bạn có thể nhấn nút "Cập nhật giá mới" bên dưới mỗi bản tin để làm mới dữ liệu nhanh chóng.`
+
 // --- DATABASE LOGIC ---
 
+// initDatabase initializes connection to MongoDB Atlas
 func initDatabase() {
 	uri := os.Getenv("MONGODB_URI")
 	// Set a timeout for connection to prevent hanging during cold starts
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	
+
 	client, err := mongo.Connect(ctx, options.Client().ApplyURI(uri))
 	if err != nil {
 		log.Printf("[DATABASE ERROR] Connection failed: %v", err)
@@ -64,6 +83,7 @@ func initDatabase() {
 	log.Println("[DATABASE] Connected to MongoDB Atlas")
 }
 
+// loadUsers retrieves all subscribed chat IDs
 func loadUsers() map[int64]bool {
 	users := make(map[int64]bool)
 	if userCollection == nil {
@@ -87,6 +107,7 @@ func loadUsers() map[int64]bool {
 	return users
 }
 
+// saveUser adds or updates a user chat ID in the database
 func saveUser(id int64) {
 	if userCollection == nil {
 		log.Println("[DATABASE ERROR] Cannot save, collection is nil")
@@ -102,12 +123,27 @@ func saveUser(id int64) {
 	}
 }
 
+// removeUser deletes a user from MongoDB by chat ID
+func removeUser(id int64) bool {
+	if userCollection == nil {
+		log.Println("[DATABASE ERROR] Cannot delete, collection is nil")
+		return false
+	}
+	filter := bson.M{"chat_id": id}
+	result, err := userCollection.DeleteOne(context.TODO(), filter)
+	if err != nil {
+		log.Printf("[DATABASE ERROR] Failed to remove user %d: %v", id, err)
+		return false
+	}
+	return result.DeletedCount > 0
+}
+
 // --- MARKET DATA LOGIC ---
 
+// getMarketData fetches financial data from Twelve Data API
 func getMarketData(symbol string, apiKey string) MarketData {
 	log.Printf("[API] Fetching quote for %s...", symbol)
 	apiUrl := fmt.Sprintf("https://api.twelvedata.com/quote?symbol=%s&apikey=%s", symbol, apiKey)
-	
 	// Explicit client with timeout to prevent Lambda from hanging
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Get(apiUrl)
@@ -131,7 +167,6 @@ func getMarketData(symbol string, apiKey string) MarketData {
 
 	p, _ := strconv.ParseFloat(result.Close, 64)
 	c, _ := strconv.ParseFloat(result.PercentChange, 64)
-
 	// Format change string with market trend indicators
 	changeStr := fmt.Sprintf("%.2f%%", c)
 	if c > 0 {
@@ -143,6 +178,7 @@ func getMarketData(symbol string, apiKey string) MarketData {
 	return MarketData{Price: p, Change: changeStr}
 }
 
+// getCachedUsdVnd manages caching for USD/VND rates to save API credits
 func getCachedUsdVnd(apiKey string) (float64, error) {
 	if time.Since(lastCacheUpdate) < cacheDuration && cachedUsdVnd > 0 {
 		log.Println("[CACHE] Using cached USD/VND rate")
@@ -157,6 +193,7 @@ func getCachedUsdVnd(apiKey string) (float64, error) {
 	return cachedUsdVnd, nil
 }
 
+// translateToVietnamese uses Google Apps Script to translate news headlines
 func translateToVietnamese(text string) string {
 	scriptURL := os.Getenv("GOOGLE_SCRIPT_URL")
 	if scriptURL == "" {
@@ -173,6 +210,7 @@ func translateToVietnamese(text string) string {
 	return string(body)
 }
 
+// formatVnd adds thousands separators to currency values
 func formatVnd(val float64) string {
 	str := fmt.Sprintf("%.0f", val)
 	var result []string
@@ -186,6 +224,7 @@ func formatVnd(val float64) string {
 	return strings.Join(result, ".")
 }
 
+// getMarketUpdate aggregates all market news and data into a single message
 func getMarketUpdate() (string, *tele.ReplyMarkup) {
 	log.Println("[SYSTEM] Generating market update report...")
 	apiKey := os.Getenv("TWELVE_DATA_API_KEY")
@@ -241,10 +280,10 @@ func getMarketUpdate() (string, *tele.ReplyMarkup) {
 
 // --- HANDLERS (AWS LAMBDA) ---
 
+// Handler processes AWS Lambda requests (Function URL triggers)
 func Handler(ctx context.Context, request events.LambdaFunctionURLRequest) (events.LambdaFunctionURLResponse, error) {
 	initDatabase()
 	token := os.Getenv("TELEGRAM_TOKEN")
-	
 	// Initialize bot in synchronous mode for Lambda environment
 	b, err := tele.NewBot(tele.Settings{
 		Token:       token,
@@ -254,7 +293,6 @@ func Handler(ctx context.Context, request events.LambdaFunctionURLRequest) (even
 		log.Printf("[ERROR] Bot initialization failed: %v", err)
 		return events.LambdaFunctionURLResponse{StatusCode: 500}, nil
 	}
-
 	// --- CRON TRIGGER / DIRECT CALL ---
 	// EventBridge or direct URL calls without body are treated as broadcast triggers
 	if request.Body == "" {
@@ -277,7 +315,6 @@ func Handler(ctx context.Context, request events.LambdaFunctionURLRequest) (even
 		return events.LambdaFunctionURLResponse{StatusCode: 200, Body: "Malformed request"}, nil
 	}
 
-	// Handle Inline Button Callbacks
 	if update.Callback != nil {
 		log.Printf("[LAMBDA] Callback interaction: %s", update.Callback.Data)
 		b.Edit(update.Callback.Message, update.Callback.Message.Text+"\n\n⌛ *Đang cập nhật dữ liệu...*", &tele.SendOptions{
@@ -294,7 +331,6 @@ func Handler(ctx context.Context, request events.LambdaFunctionURLRequest) (even
 		b.Respond(update.Callback, &tele.CallbackResponse{})
 		return events.LambdaFunctionURLResponse{StatusCode: 200}, nil
 	}
-
 	// Handle Standard Messages
 	if update.Message != nil {
 		m := update.Message
@@ -302,7 +338,9 @@ func Handler(ctx context.Context, request events.LambdaFunctionURLRequest) (even
 		switch m.Text {
 		case "/start":
 			saveUser(m.Chat.ID)
-			b.Send(m.Chat, "Chào mừng Trader! Bạn đã đăng ký nhận bản tin tự động.")
+			b.Send(m.Chat, "Chào mừng Trader! Bạn đã đăng ký nhận bản tin tự động hàng ngày. Gõ /help để xem hướng dẫn.")
+		case "/help":
+			b.Send(m.Chat, helpMessage, &tele.SendOptions{ParseMode: tele.ModeMarkdown})
 		case "/update":
 			tmpMsg, _ := b.Send(m.Chat, "⌛ *Đang lấy dữ liệu thị trường mới nhất...*", &tele.SendOptions{ParseMode: tele.ModeMarkdown})
 			msg, menu := getMarketUpdate()
@@ -311,8 +349,15 @@ func Handler(ctx context.Context, request events.LambdaFunctionURLRequest) (even
 				ReplyMarkup:           menu,
 				DisableWebPagePreview: true,
 			})
+		case "/quit", "/cancel":
+			if removeUser(m.Chat.ID) {
+				b.Send(m.Chat, "❌ Bạn đã hủy đăng ký nhận bản tin thành công. Hẹn gặp lại!")
+			} else {
+				b.Send(m.Chat, "ℹ️ Bạn hiện chưa đăng ký nhận bản tin hoặc đã hủy trước đó.")
+			}
 		default:
-			b.Send(m.Chat, "🤖 Vui lòng sử dụng /update để cập nhật thị trường mới nhất.")
+			// Fallback message for unrecognized commands
+			b.Send(m.Chat, "🤖 Lệnh không hợp lệ. Vui lòng dùng /help để xem danh sách các lệnh hỗ trợ.")
 		}
 	}
 
@@ -343,7 +388,11 @@ func main() {
 
 		b.Handle("/start", func(c tele.Context) error {
 			saveUser(c.Chat().ID)
-			return c.Send("🛠 Chế độ thử nghiệm (Local Mode) đã sẵn sàng.")
+			return c.Send("🛠 Chế độ thử nghiệm đã sẵn sàng. Bạn đã được đăng ký. Gõ /help để xem hướng dẫn.")
+		})
+
+		b.Handle("/help", func(c tele.Context) error {
+			return c.Send(helpMessage, &tele.SendOptions{ParseMode: tele.ModeMarkdown})
 		})
 
 		b.Handle("/update", func(c tele.Context) error {
@@ -355,6 +404,25 @@ func main() {
 				DisableWebPagePreview: true,
 			})
 			return err
+		})
+
+		b.Handle("/quit", func(c tele.Context) error {
+			if removeUser(c.Chat().ID) {
+				return c.Send("❌ Đã hủy đăng ký nhận tin.")
+			}
+			return c.Send("ℹ️ Bạn chưa đăng ký.")
+		})
+
+		b.Handle("/cancel", func(c tele.Context) error {
+			if removeUser(c.Chat().ID) {
+				return c.Send("❌ Đã hủy đăng ký nhận tin.")
+			}
+			return c.Send("ℹ️ Bạn chưa đăng ký.")
+		})
+
+		// Catch-all handler for text that doesn't match specific commands
+		b.Handle(tele.OnText, func(c tele.Context) error {
+			return c.Send("🤖 Lệnh không hợp lệ. Vui lòng dùng /help để xem danh sách các lệnh hỗ trợ.")
 		})
 
 		b.Handle("\fbtn_update_price", func(c tele.Context) error {
