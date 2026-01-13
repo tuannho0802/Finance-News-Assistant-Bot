@@ -228,7 +228,8 @@ func getMarketUpdate() (string, *tele.ReplyMarkup) {
 
 // --- HANDLERS (AWS LAMBDA) ---
 
-func Handler(ctx context.Context, request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
+// Updated to use LambdaFunctionURLRequest for compatibility with AWS Lambda Function URL
+func Handler(ctx context.Context, request events.LambdaFunctionURLRequest) (events.LambdaFunctionURLResponse, error) {
 	initDatabase()
 	token := os.Getenv("TELEGRAM_TOKEN")
 	b, _ := tele.NewBot(tele.Settings{
@@ -237,7 +238,8 @@ func Handler(ctx context.Context, request events.APIGatewayProxyRequest) (events
 	})
 
 	// --- CRON TRIGGER ---
-	if request.HTTPMethod == "" {
+	// Updated condition to check empty body which is common for EventBridge/Direct URL calls
+	if request.Body == "" {
 		log.Println("[LAMBDA] Cron trigger received")
 		users := loadUsers()
 		msg, menu := getMarketUpdate()
@@ -248,12 +250,13 @@ func Handler(ctx context.Context, request events.APIGatewayProxyRequest) (events
 				DisableWebPagePreview: true,
 			})
 		}
-		return events.APIGatewayProxyResponse{StatusCode: 200, Body: "Broadcast sent"}, nil
+		return events.LambdaFunctionURLResponse{StatusCode: 200, Body: "Broadcast sent"}, nil
 	}
 
 	var update tele.Update
 	if err := json.Unmarshal([]byte(request.Body), &update); err != nil {
-		return events.APIGatewayProxyResponse{StatusCode: 400}, nil
+		// Return 200 even on error to prevent Telegram from retrying indefinitely
+		return events.LambdaFunctionURLResponse{StatusCode: 200}, nil
 	}
 
 	// Handle Inline Button callback for Lambda with Double Edit logic
@@ -275,7 +278,7 @@ func Handler(ctx context.Context, request events.APIGatewayProxyRequest) (events
 			DisableWebPagePreview: true,
 		})
 		b.Respond(update.Callback, &tele.CallbackResponse{})
-		return events.APIGatewayProxyResponse{StatusCode: 200}, nil
+		return events.LambdaFunctionURLResponse{StatusCode: 200}, nil
 	}
 
 	if update.Message != nil {
@@ -305,7 +308,7 @@ func Handler(ctx context.Context, request events.APIGatewayProxyRequest) (events
 		}
 	}
 
-	return events.APIGatewayProxyResponse{StatusCode: 200, Body: "OK"}, nil
+	return events.LambdaFunctionURLResponse{StatusCode: 200, Body: "OK"}, nil
 }
 
 // --- MAIN (LOCAL MODE) ---

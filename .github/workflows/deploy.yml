@@ -19,11 +19,12 @@ jobs:
 
       - name: Build binary
         run: |
+          # Build for Linux amd64 and name it 'bootstrap' for Lambda AL2023 compatibility
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bootstrap main.go
-          zip bootstrap.zip bootstrap  # Tạo file tên là bootstrap.zip
+          zip bootstrap.zip bootstrap
 
       - name: Deploy to Lambda
-        uses: appleboy/lambda-action@v0.2.0 # Set specific version
+        uses: appleboy/lambda-action@v0.2.0
         with:
           aws_access_key_id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws_secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -33,4 +34,6 @@ jobs:
 
       - name: Set Telegram Webhook
         run: |
-          curl -F "url=${{ secrets.API_GATEWAY_URL }}" https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/setWebhook
+          # Use -f to fail the step if the URL is wrong or token is invalid
+          # The token MUST follow the 'bot' keyword directly in the path without space
+          curl -f -F "url=${{ secrets.API_GATEWAY_URL }}" "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/setWebhook"
