@@ -6,7 +6,6 @@ require (
 	github.com/aws/aws-lambda-go v1.51.1
 	github.com/joho/godotenv v1.5.1
 	github.com/mmcdole/gofeed v1.3.0
-	github.com/robfig/cron/v3 v3.0.1
 	go.mongodb.org/mongo-driver v1.17.6
 	gopkg.in/telebot.v3 v3.3.8
 )
