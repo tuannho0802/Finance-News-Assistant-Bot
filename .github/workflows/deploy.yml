@@ -19,11 +19,15 @@ jobs:
 
       - name: Build binary
         run: |
+          # Xóa file cũ nếu có để tránh build lỗi
+          rm -f bootstrap bootstrap.zip
+          # Build binary với tên bắt buộc là bootstrap cho AWS Lambda
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bootstrap main.go
-          zip bootstrap.zip bootstrap  # Tạo file tên là bootstrap.zip
+          # Nén binary vào file zip
+          zip bootstrap.zip bootstrap
 
       - name: Deploy to Lambda
-        uses: appleboy/lambda-action@v0.2.0 # Set specific version
+        uses: appleboy/lambda-action@v0.2.0
         with:
           aws_access_key_id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws_secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -32,5 +36,6 @@ jobs:
           zip_file: bootstrap.zip
 
       - name: Set Telegram Webhook
+        # Sử dụng --fail để GitHub báo lỗi nếu curl thất bại
         run: |
-          curl -F "url=${{ secrets.API_GATEWAY_URL }}" https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/setWebhook
+          curl --fail -F "url=${{ secrets.API_GATEWAY_URL }}" https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/setWebhook
